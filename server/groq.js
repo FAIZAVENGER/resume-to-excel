@@ -1,15 +1,22 @@
 import { UserError } from './extract.js';
 
 const baseUrl = () => (process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
-const TEXT_MODEL = () => process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
-const FALLBACK_MODEL = () => process.env.GROQ_FALLBACK_MODEL || 'llama-3.1-8b-instant';
-const VISION_MODEL = () => process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+// Models are tried in order. If one is retired, rate limited, or not available to your key,
+// the next one is used. Override with GROQ_MODELS / GROQ_VISION_MODELS (comma separated).
+const DEFAULT_TEXT_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
+const DEFAULT_VISION_MODELS = ['qwen/qwen3.8-27b'];
+
+const csv = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+const textModels = () => (csv(process.env.GROQ_MODELS).length ? csv(process.env.GROQ_MODELS) : DEFAULT_TEXT_MODELS);
+const visionModels = () =>
+  csv(process.env.GROQ_VISION_MODELS).length ? csv(process.env.GROQ_VISION_MODELS) : DEFAULT_VISION_MODELS;
 
 // Free-tier Groq models have small per-minute token budgets, so keep the prompt compact.
 const MAX_RESUME_CHARS = 14000;
 
 export const groqConfigured = () => Boolean(process.env.GROQ_API_KEY);
-export const activeModels = () => ({ text: TEXT_MODEL(), vision: VISION_MODEL() });
+export const activeModels = () => ({ text: textModels(), vision: visionModels() });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -41,20 +48,31 @@ function userInstruction(jobContext) {
     : 'No job requirement was provided.\n\n';
 }
 
-async function callGroq({ model, messages, json }) {
+// ---------- Groq calls ----------
+function buildBody(model, messages, { json, reasoning }) {
+  const body = {
+    model,
+    messages,
+    temperature: 0,
+    // Reasoning models spend part of this budget on thinking, so leave plenty of room.
+    max_completion_tokens: 4000,
+  };
+  if (json) body.response_format = { type: 'json_object' };
+  if (reasoning && model.startsWith('openai/gpt-oss')) {
+    body.reasoning_effort = 'low';
+    body.include_reasoning = false;
+  }
+  return body;
+}
+
+async function callGroq(body) {
   const res = await fetch(`${baseUrl()}/chat/completions`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0,
-      max_tokens: 1800,
-      ...(json ? { response_format: { type: 'json_object' } } : {}),
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -69,41 +87,75 @@ async function callGroq({ model, messages, json }) {
     err.retryAfter = Number(res.headers.get('retry-after')) || 0;
     throw err;
   }
-  const body = await res.json();
-  return body?.choices?.[0]?.message?.content ?? '';
+  const json = await res.json();
+  const content = json?.choices?.[0]?.message?.content;
+  if (!content || !String(content).trim()) {
+    const err = new Error('The model returned an empty answer.');
+    err.status = 502;
+    throw err;
+  }
+  return content;
 }
 
-// Primary model -> wait once on rate limit -> fallback model.
-async function callWithFallback({ messages, model, fallback, json }) {
-  try {
-    return await callGroq({ model, messages, json });
-  } catch (err) {
-    if (err.status === 401) {
-      throw new UserError('Groq rejected the API key. Check GROQ_API_KEY in your .env file.', 401);
-    }
-    if (err.status === 429) {
-      await sleep(Math.min(Math.max(err.retryAfter, 2), 10) * 1000);
-      try {
-        return await callGroq({ model, messages, json });
-      } catch (err2) {
-        if (err2.status !== 429 || !fallback) {
-          throw new UserError('Groq rate limit reached. Wait a minute and retry.', 429);
-        }
+// One model, degrading optional parameters it does not accept.
+async function callModel(model, messages, json) {
+  let opts = { json, reasoning: true };
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await callGroq(buildBody(model, messages, opts));
+    } catch (err) {
+      if (err.status === 400 && opts.reasoning && /reasoning/i.test(err.message)) {
+        opts = { ...opts, reasoning: false };
+        continue;
       }
-    }
-    if (fallback && [400, 404, 413, 429, 500, 503].includes(err.status)) {
-      try {
-        return await callGroq({ model: fallback, messages, json });
-      } catch (err3) {
-        throw new UserError(`Groq error: ${err3.message}`, 502);
+      if (err.status === 400 && opts.json && /json|response_format/i.test(err.message)) {
+        opts = { ...opts, json: false };
+        continue;
       }
+      throw err;
     }
-    throw new UserError(`Groq error: ${err.message}`, 502);
   }
+  throw new Error('Groq request failed.');
+}
+
+// Walks the model list until one answers.
+async function runChain({ models, messages, json }) {
+  let last = null;
+  let rateLimited = false;
+
+  for (let pass = 0; pass < 2; pass++) {
+    rateLimited = false;
+    for (const model of models) {
+      try {
+        return await callModel(model, messages, json);
+      } catch (err) {
+        if (err.status === 401) {
+          throw new UserError('Groq rejected the API key. Check GROQ_API_KEY in your environment settings.', 401);
+        }
+        if (err.status === 429) rateLimited = true;
+        last = err;
+      }
+    }
+    // Every model was rate limited: wait briefly and make one more pass.
+    if (!(rateLimited && pass === 0)) break;
+    await sleep(Math.min(Math.max(last?.retryAfter || 0, 3), 12) * 1000);
+  }
+
+  if (rateLimited) {
+    throw new UserError('Groq rate limit reached. Wait a minute and try again.', 429);
+  }
+  const hint = /does not exist|do not have access|decommission/i.test(last?.message || '')
+    ? ' Set GROQ_MODELS in your environment to model IDs your key can use (see console.groq.com/docs/models).'
+    : '';
+  const reason = String(last?.message || 'request failed').replace(/[.\s]+$/, '');
+  throw new UserError(`Groq error: ${reason}. Tried: ${models.join(', ')}.${hint}`, 502);
 }
 
 function parseJson(raw) {
-  const text = String(raw || '').trim();
+  const text = String(raw || '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/```(?:json)?/gi, '')
+    .trim();
   try {
     return JSON.parse(text);
   } catch {
@@ -170,7 +222,7 @@ export function normalize(raw, sourceText = '') {
     ? raw.education.map((e) => (typeof e === 'string' ? e : Object.values(e || {}).join(' - '))).join('; ')
     : str(raw.education);
 
-  let total = years(raw.totalExperienceYears);
+  const total = years(raw.totalExperienceYears);
   let relevant = years(raw.relevantExperienceYears);
   if (total && relevant && Number(relevant) > Number(total)) relevant = total;
 
@@ -195,7 +247,7 @@ export function normalize(raw, sourceText = '') {
 export async function parseResume({ kind, text, image, jobContext }) {
   if (!groqConfigured()) {
     throw new UserError(
-      'GROQ_API_KEY is not set. Create a .env file in the project root with GROQ_API_KEY=your_key and restart the server.',
+      'GROQ_API_KEY is not set. Add it to your .env file (or Render environment settings) and restart.',
       500
     );
   }
@@ -205,10 +257,9 @@ export async function parseResume({ kind, text, image, jobContext }) {
       { type: 'text', text: `${userInstruction(jobContext)}The resume is the attached image. Read it and return the JSON.` },
       { type: 'image_url', image_url: { url: `data:${image.mime};base64,${image.base64}` } },
     ];
-    const raw = await callWithFallback({
-      model: VISION_MODEL(),
-      fallback: null,
-      json: false,
+    const raw = await runChain({
+      models: visionModels(),
+      json: true,
       messages: [
         { role: 'system', content: buildSystemPrompt() },
         { role: 'user', content },
@@ -218,9 +269,8 @@ export async function parseResume({ kind, text, image, jobContext }) {
   }
 
   const clipped = text.slice(0, MAX_RESUME_CHARS);
-  const raw = await callWithFallback({
-    model: TEXT_MODEL(),
-    fallback: FALLBACK_MODEL(),
+  const raw = await runChain({
+    models: textModels(),
     json: true,
     messages: [
       { role: 'system', content: buildSystemPrompt() },
